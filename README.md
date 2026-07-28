@@ -4,7 +4,9 @@
 전공·부전공, 교양, 기초를 포함한 1,590개 강좌를 검색하고 충돌 없이
 시간표에 조합할 수 있습니다.
 
-배포 사이트: https://hufs-grid-2026.daehyuh.chatgpt.site
+GitHub Pages: https://daehyuh.github.io/2026-timetable/
+
+보조 배포: https://hufs-grid-2026.daehyuh.chatgpt.site
 
 ## 주요 기능
 
@@ -29,6 +31,7 @@ npm run dev
 
 ```bash
 npm test
+npm run test:pages
 npm run lint
 ```
 
@@ -50,3 +53,9 @@ node validate.mjs
 생성되는 `crawler/data`는 Git에 포함되지 않습니다. 검증이 끝난
 `courses.json`과 `summary.json`을 웹에 반영할 때만 `public/data`로
 복사합니다.
+
+## GitHub Pages 배포
+
+`main` 브랜치에 푸시하면 `.github/workflows/deploy-pages.yml`이 Pages용
+정적 사이트를 빌드해 `https://daehyuh.github.io/2026-timetable/`에
+자동 배포합니다.

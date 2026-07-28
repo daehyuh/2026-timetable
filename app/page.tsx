@@ -243,8 +243,8 @@ export default function Home() {
     async function loadData() {
       try {
         const [coursesResponse, summaryResponse] = await Promise.all([
-          fetch("/data/courses.json", { signal: controller.signal }),
-          fetch("/data/summary.json", { signal: controller.signal }),
+          fetch("./data/courses.json", { signal: controller.signal }),
+          fetch("./data/summary.json", { signal: controller.signal }),
         ]);
 
         if (!coursesResponse.ok || !summaryResponse.ok) {
