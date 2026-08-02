@@ -7,10 +7,14 @@ import { fileURLToPath } from "node:url";
 
 const SOURCE_PAGE = "https://wis.hufs.ac.kr/src08/jsp/lecture/LECTURE2020L.jsp";
 const API_URL = "https://wis.hufs.ac.kr/hufs";
+const CAMPUSES = [
+  { code: "H1", label: "서울", label_en: "Seoul" },
+  { code: "H2", label: "글로벌", label_en: "Global" },
+];
 const DEFAULTS = {
   year: 2026,
   semester: 3,
-  campus: "H2",
+  campus: "all",
   delayMs: 350,
   outputDir: path.join(path.dirname(fileURLToPath(import.meta.url)), "data"),
 };
@@ -102,7 +106,7 @@ const CSV_COLUMNS = [
 ];
 
 function printHelp() {
-  console.log(`HUFS 글로벌캠퍼스 전체 강좌 크롤러
+  console.log(`HUFS 서울·글로벌캠퍼스 전체 강좌 크롤러
 
 사용법:
   node crawl.mjs [옵션]
@@ -110,11 +114,12 @@ function printHelp() {
 옵션:
   --year <년도>          기본값: 2026
   --semester <코드>      1=1학기, 2=여름, 3=2학기, 4=겨울 (기본값: 3)
+  --campus <범위>        all=전체, H1=서울, H2=글로벌 (기본값: all)
   --delay-ms <밀리초>    영역별 요청 사이 대기 (기본값: 350)
   --output-dir <경로>    결과 폴더 (기본값: ./data)
   --help                 도움말
 
-학부(A), 글로벌캠퍼스(H2)의 전공/부전공·교양·기초 전체 영역을 합쳐 수집합니다.`);
+학부(A), 서울(H1)·글로벌(H2)캠퍼스의 전공/부전공·교양·기초 전체 영역을 합쳐 수집합니다.`);
 }
 
 export function parseArgs(argv) {
@@ -124,6 +129,7 @@ export function parseArgs(argv) {
     if (arg === "--help") options.help = true;
     else if (arg === "--year") options.year = Number(argv[++index]);
     else if (arg === "--semester") options.semester = Number(argv[++index]);
+    else if (arg === "--campus") options.campus = String(argv[++index]);
     else if (arg === "--delay-ms") options.delayMs = Number(argv[++index]);
     else if (arg === "--output-dir") options.outputDir = path.resolve(argv[++index]);
     else throw new Error(`알 수 없는 옵션: ${arg}`);
@@ -134,10 +140,23 @@ export function parseArgs(argv) {
   if (![1, 2, 3, 4].includes(options.semester)) {
     throw new Error("--semester는 1, 2, 3, 4 중 하나여야 합니다.");
   }
+  if (!["all", "H1", "H2"].includes(options.campus)) {
+    throw new Error("--campus는 all, H1, H2 중 하나여야 합니다.");
+  }
   if (!Number.isFinite(options.delayMs) || options.delayMs < 200) {
     throw new Error("--delay-ms는 서버 부담을 줄이기 위해 200 이상이어야 합니다.");
   }
   return options;
+}
+
+function selectedCampuses(value) {
+  return value === "all"
+    ? CAMPUSES
+    : CAMPUSES.filter((campus) => campus.code === value);
+}
+
+function campusLabel(code) {
+  return CAMPUSES.find((campus) => campus.code === code)?.label || code;
 }
 
 function semesterLabel(code) {
@@ -181,21 +200,64 @@ async function sleep(milliseconds) {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function postHufs(parameters, attempt = 1) {
-  const response = await fetch(API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "user-agent": "HUFS-course-data-collector/2.0 (low-rate academic schedule lookup)",
-      referer: SOURCE_PAGE,
-    },
-    body: new URLSearchParams(parameters),
-    signal: AbortSignal.timeout(30_000),
-  });
+function retryDelay(attempt, retryAfterHeader = null) {
+  const retryAfterSeconds = retryAfterHeader === null
+    ? Number.NaN
+    : Number(retryAfterHeader);
+  return Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+    ? Math.min(retryAfterSeconds * 1_000, 30_000)
+    : Math.min(1_000 * 2 ** (attempt - 1), 8_000);
+}
+
+function isRetryableRequestError(error) {
+  return error?.name === "AbortError" ||
+    error?.name === "TimeoutError" ||
+    error instanceof TypeError;
+}
+
+export async function postHufs(
+  parameters,
+  attempt = 1,
+  dependencies = {},
+) {
+  const fetchImpl = dependencies.fetchImpl || globalThis.fetch;
+  const sleepImpl = dependencies.sleepImpl || sleep;
+  let response;
+
+  try {
+    response = await fetchImpl(API_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "user-agent": "HUFS-course-data-collector/2.0 (low-rate academic schedule lookup)",
+        referer: SOURCE_PAGE,
+      },
+      body: new URLSearchParams(parameters),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (error) {
+    if (attempt < 4 && isRetryableRequestError(error)) {
+      const delay = retryDelay(attempt);
+      console.warn(
+        `HUFS API 네트워크 오류(${error.name}); ${delay}ms 후 재시도합니다 ` +
+        `(${attempt}/3).`,
+      );
+      await sleepImpl(delay);
+      return postHufs(parameters, attempt + 1, { fetchImpl, sleepImpl });
+    }
+    throw new Error(`HUFS API 요청 실패: ${error.message}`, { cause: error });
+  }
+
   if (!response.ok) {
-    if (attempt < 3 && response.status >= 500) {
-      await sleep(750 * attempt);
-      return postHufs(parameters, attempt + 1);
+    const retryable = response.status === 429 || response.status >= 500;
+    if (attempt < 4 && retryable) {
+      const delay = retryDelay(attempt, response.headers.get("retry-after"));
+      console.warn(
+        `HUFS API HTTP ${response.status}; ${delay}ms 후 재시도합니다 ` +
+        `(${attempt}/3).`,
+      );
+      await sleepImpl(delay);
+      return postHufs(parameters, attempt + 1, { fetchImpl, sleepImpl });
     }
     throw new Error(`HUFS API 응답 오류: HTTP ${response.status}`);
   }
@@ -269,8 +331,10 @@ function buildSyllabusUrl(record) {
   return `https://wis.hufs.ac.kr/src08/jsp/lecture/syllabus.jsp?${query}`;
 }
 
-function contextFor(collection, area) {
+function contextFor(collection, area, campus) {
   return {
+    campus_code: campus.code,
+    campus: campus.label,
     classification_code: collection.code,
     classification: collection.label,
     area_code: clean(area.code),
@@ -283,7 +347,10 @@ export function normalizeCourse(record, context, collectedAt, options = DEFAULTS
   const meetings = parseMeetings(record.dayTimeDisplay);
   const days = [...new Set(meetings.map((meeting) => meeting.day))];
   const periods = meetings.flatMap((meeting) => meeting.periods);
+  const campusCode = clean(record.campus) || clean(context.campus_code) || options.campus;
   const queryContext = {
+    campus_code: campusCode,
+    campus: campusLabel(campusCode),
     classification_code: clean(context.classification_code || "2"),
     classification: clean(context.classification || "교양"),
     area_code: clean(context.area_code || context.code),
@@ -294,8 +361,8 @@ export function normalizeCourse(record, context, collectedAt, options = DEFAULTS
     year: nullableNumber(record.ledgYear) ?? options.year,
     semester_code: nullableNumber(record.ledgSessn) ?? options.semester,
     semester: semesterLabel(nullableNumber(record.ledgSessn) ?? options.semester),
-    campus_code: clean(record.campus) || options.campus,
-    campus: "글로벌",
+    campus_code: campusCode,
+    campus: campusLabel(campusCode),
     classification_code: queryContext.classification_code,
     classification: queryContext.classification,
     classification_types: [queryContext.classification],
@@ -401,9 +468,10 @@ function courseRequest(options, areaCode, classificationCode) {
 
 function mergeContext(existing, duplicate) {
   for (const context of duplicate.query_contexts) {
-    const contextKey = `${context.classification_code}:${context.area_code}`;
+    const contextKey =
+      `${context.campus_code}:${context.classification_code}:${context.area_code}`;
     if (!existing.query_contexts.some((item) =>
-      `${item.classification_code}:${item.area_code}` === contextKey)) {
+      `${item.campus_code}:${item.classification_code}:${item.area_code}` === contextKey)) {
       existing.query_contexts.push(context);
     }
   }
@@ -415,57 +483,17 @@ function mergeContext(existing, duplicate) {
   existing.area_names = [...new Set([...existing.area_names, ...duplicate.area_names])];
 }
 
-export async function crawl(options) {
-  const collectedAt = new Date().toISOString();
-  const rawByArea = [];
-  const normalizedRows = [];
-  const collectionSummaries = [];
-  let completedAreas = 0;
-
-  for (const collection of COLLECTIONS) {
-    const areas = await getAreas(options, collection);
-    if (areas.length === 0) throw new Error(`${collection.label} 영역 목록이 비어 있습니다.`);
-    console.log(`${collection.label} 조회 영역 ${areas.length}개를 확인했습니다.`);
-    const collectionStart = normalizedRows.length;
-
-    for (let index = 0; index < areas.length; index += 1) {
-      const area = areas[index];
-      const payload = await postHufs(courseRequest(options, area.code, collection.code));
-      const records = asArray(payload);
-      const context = contextFor(collection, area);
-      rawByArea.push({
-        collection: { key: collection.key, code: collection.code, label: collection.label },
-        area,
-        data_count: records.length,
-        records,
-      });
-      normalizedRows.push(...records.map((record) =>
-        normalizeCourse(record, context, collectedAt, options)));
-      completedAreas += 1;
-      console.log(
-        `[${collection.label} ${index + 1}/${areas.length}] ${area.name}: ${records.length}개`,
-      );
-      await sleep(options.delayMs);
-    }
-
-    collectionSummaries.push({
-      key: collection.key,
-      code: collection.code,
-      label: collection.label,
-      area_count: areas.length,
-      raw_course_count: normalizedRows.length - collectionStart,
-      areas,
-    });
-  }
-
-  const duplicateCourseCodes = [];
-  const uniqueCourses = [];
+export function deduplicateCourses(normalizedRows) {
+  const duplicates = [];
+  const courses = [];
   const seen = new Map();
+
   for (const course of normalizedRows) {
-    const key = `${course.year}-${course.semester_code}-${course.course_code}`;
+    const key =
+      `${course.year}-${course.semester_code}-${course.campus_code}-${course.course_code}`;
     const existing = seen.get(key);
     if (existing) {
-      duplicateCourseCodes.push({
+      duplicates.push({
         key,
         first_context: existing.query_contexts[0],
         duplicate_context: course.query_contexts[0],
@@ -474,31 +502,183 @@ export async function crawl(options) {
       continue;
     }
     seen.set(key, course);
-    uniqueCourses.push(course);
+    courses.push(course);
   }
+
+  return { courses, duplicates };
+}
+
+function classificationSummary(courses, summaries, collection) {
+  return {
+    code: collection.code,
+    label: collection.label,
+    area_count: summaries.reduce(
+      (total, summary) => total + summary.area_count,
+      0,
+    ),
+    raw_course_count: summaries.reduce(
+      (total, summary) => total + summary.raw_course_count,
+      0,
+    ),
+    unique_course_count: courses.filter((course) =>
+      course.classification_types.includes(collection.label)).length,
+  };
+}
+
+export function buildCountsByClassification(courses, collectionSummaries) {
+  return Object.fromEntries(
+    COLLECTIONS.map((collection) => [
+      collection.key,
+      classificationSummary(
+        courses,
+        collectionSummaries.filter((summary) => summary.key === collection.key),
+        collection,
+      ),
+    ]),
+  );
+}
+
+export function buildCountsByCampus(courses, collectionSummaries, campuses) {
+  return Object.fromEntries(
+    campuses.map((campus) => {
+      const campusCourses = courses.filter(
+        (course) => course.campus_code === campus.code,
+      );
+      const campusCollections = collectionSummaries.filter(
+        (summary) => summary.campus_code === campus.code,
+      );
+      return [
+        campus.code,
+        {
+          code: campus.code,
+          label: campus.label,
+          label_en: campus.label_en,
+          area_count: campusCollections.reduce(
+            (total, summary) => total + summary.area_count,
+            0,
+          ),
+          raw_course_count: campusCollections.reduce(
+            (total, summary) => total + summary.raw_course_count,
+            0,
+          ),
+          unique_course_count: campusCourses.length,
+          online_count: campusCourses.filter((course) => course.online).length,
+          pass_fail_count: campusCourses.filter((course) => course.pass_fail).length,
+          syllabus_count: campusCourses.filter(
+            (course) => course.syllabus_available,
+          ).length,
+          counts_by_classification: Object.fromEntries(
+            COLLECTIONS.map((collection) => [
+              collection.key,
+              classificationSummary(
+                campusCourses,
+                campusCollections.filter(
+                  (summary) => summary.key === collection.key,
+                ),
+                collection,
+              ),
+            ]),
+          ),
+        },
+      ];
+    }),
+  );
+}
+
+export async function crawl(options) {
+  const collectedAt = new Date().toISOString();
+  const rawByArea = [];
+  const normalizedRows = [];
+  const collectionSummaries = [];
+  const campuses = selectedCampuses(options.campus);
+  let completedAreas = 0;
+
+  for (const campus of campuses) {
+    const campusOptions = { ...options, campus: campus.code };
+
+    for (const collection of COLLECTIONS) {
+      const areas = await getAreas(campusOptions, collection);
+      if (areas.length === 0) {
+        throw new Error(`${campus.label} ${collection.label} 영역 목록이 비어 있습니다.`);
+      }
+      console.log(
+        `${campus.label}캠퍼스 ${collection.label} 조회 영역 ` +
+        `${areas.length}개를 확인했습니다.`,
+      );
+      const collectionStart = normalizedRows.length;
+
+      for (let index = 0; index < areas.length; index += 1) {
+        const area = areas[index];
+        const payload = await postHufs(
+          courseRequest(campusOptions, area.code, collection.code),
+        );
+        const records = asArray(payload);
+        const context = contextFor(collection, area, campus);
+        rawByArea.push({
+          campus,
+          collection: {
+            key: collection.key,
+            code: collection.code,
+            label: collection.label,
+          },
+          area,
+          data_count: records.length,
+          records,
+        });
+        normalizedRows.push(
+          ...records.map((record) =>
+            normalizeCourse(record, context, collectedAt, campusOptions)),
+        );
+        completedAreas += 1;
+        console.log(
+          `[${campus.label} · ${collection.label} ${index + 1}/${areas.length}] ` +
+          `${area.name}: ${records.length}개`,
+        );
+        await sleep(options.delayMs);
+      }
+
+      collectionSummaries.push({
+        campus_code: campus.code,
+        campus: campus.label,
+        key: collection.key,
+        code: collection.code,
+        label: collection.label,
+        area_count: areas.length,
+        raw_course_count: normalizedRows.length - collectionStart,
+        areas,
+      });
+    }
+  }
+
+  const {
+    courses: uniqueCourses,
+    duplicates: duplicateCourseCodes,
+  } = deduplicateCourses(normalizedRows);
   uniqueCourses.sort((a, b) =>
+    a.campus_code.localeCompare(b.campus_code, "ko") ||
     a.classification_code.localeCompare(b.classification_code, "ko") ||
     a.area.localeCompare(b.area, "ko") ||
     a.course_code.localeCompare(b.course_code, "ko"),
   );
 
-  const countsByClassification = Object.fromEntries(collectionSummaries.map((collection) => [
-    collection.key,
-    {
-      code: collection.code,
-      label: collection.label,
-      area_count: collection.area_count,
-      raw_course_count: collection.raw_course_count,
-      unique_course_count: uniqueCourses.filter((course) =>
-        course.classification_types.includes(collection.label)).length,
-    },
-  ]));
+  const countsByClassification = buildCountsByClassification(
+    uniqueCourses,
+    collectionSummaries,
+  );
+  const countsByCampus = buildCountsByCampus(
+    uniqueCourses,
+    collectionSummaries,
+    campuses,
+  );
   const summary = {
     year: options.year,
     semester_code: options.semester,
     semester: semesterLabel(options.semester),
-    campus_code: options.campus,
-    campus: "글로벌",
+    campus_code: campuses.length === 1 ? campuses[0].code : "ALL",
+    campus: campuses.map((campus) => campus.label).join("·"),
+    campus_codes: campuses.map((campus) => campus.code),
+    campuses: campuses.map((campus) => campus.label),
+    campus_count: campuses.length,
     scope: COLLECTIONS.map((collection) => collection.label),
     source_url: SOURCE_PAGE,
     collected_at: collectedAt,
@@ -511,12 +691,19 @@ export async function crawl(options) {
     pass_fail_count: uniqueCourses.filter((course) => course.pass_fail).length,
     syllabus_count: uniqueCourses.filter((course) => course.syllabus_available).length,
     counts_by_classification: countsByClassification,
-    areas: rawByArea.map(({ collection, area, data_count: dataCount }) => ({
-      classification_code: collection.code,
-      classification: collection.label,
-      ...area,
-      course_count: dataCount,
-    })),
+    counts_by_campus: countsByCampus,
+    areas: rawByArea.map(({ campus, collection, area, data_count: dataCount }) => {
+      const { campus: sourceCampus, ...areaFields } = area;
+      return {
+        campus_code: campus.code,
+        campus: campus.label,
+        source_campus: sourceCampus,
+        classification_code: collection.code,
+        classification: collection.label,
+        ...areaFields,
+        course_count: dataCount,
+      };
+    }),
     duplicates: duplicateCourseCodes,
   };
 
@@ -552,8 +739,11 @@ async function main() {
     printHelp();
     return;
   }
+  const campusNames = selectedCampuses(options.campus)
+    .map((campus) => campus.label)
+    .join("·");
   console.log(
-    `${options.year}년 ${semesterLabel(options.semester)} 글로벌캠퍼스 ` +
+    `${options.year}년 ${semesterLabel(options.semester)} ${campusNames}캠퍼스 ` +
     "전공/부전공·교양·기초 강좌 수집을 시작합니다.",
   );
   const { summary } = await crawl(options);

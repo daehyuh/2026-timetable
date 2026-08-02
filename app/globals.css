@@ -213,6 +213,91 @@ main {
   word-break: keep-all;
 }
 
+.data-freshness {
+  display: flex;
+  max-width: 620px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem 1rem;
+  margin-top: 1.35rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line-dark);
+}
+
+.freshness-indicator {
+  display: flex;
+  flex: 1 1 250px;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.freshness-indicator > span:last-child {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.freshness-indicator strong {
+  font-size: 0.78rem;
+  font-weight: 850;
+}
+
+.freshness-indicator small {
+  color: var(--ink-soft);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.freshness-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border: 2px solid var(--ink);
+  border-radius: 50%;
+  background: var(--lime);
+  box-shadow: 0 0 0 4px rgba(223, 255, 105, 0.38);
+}
+
+.refresh-data-button {
+  min-height: 38px;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--ink);
+  border-radius: 999px;
+  background: var(--white);
+  font-size: 0.72rem;
+  font-weight: 850;
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.refresh-data-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: var(--ink);
+  color: var(--lime);
+}
+
+.refresh-data-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.refresh-status {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 0.7rem;
+  font-weight: 750;
+}
+
+.refresh-status-success {
+  color: var(--ink-soft);
+}
+
+.refresh-status-warning {
+  color: #a63a2b;
+}
+
 .hero-stats {
   position: relative;
   display: grid;
@@ -440,6 +525,22 @@ fieldset {
   background: var(--paper);
 }
 
+.campus-segmented-control {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.campus-segmented-control button {
+  display: grid;
+  place-items: center;
+  gap: 0.12rem;
+}
+
+.campus-segmented-control small {
+  font-size: 0.56rem;
+  font-weight: 700;
+  opacity: 0.64;
+}
+
 .segmented-control button {
   min-height: 42px;
   padding: 0.5rem 0.35rem;
@@ -604,6 +705,19 @@ fieldset {
 
 .classification-badge {
   border: 1px solid rgba(16, 41, 35, 0.25);
+}
+
+.campus-badge {
+  border: 1px solid rgba(16, 41, 35, 0.24);
+  background: var(--white);
+}
+
+.campus-h1 {
+  box-shadow: inset 0 -3px 0 #b8ddff;
+}
+
+.campus-h2 {
+  box-shadow: inset 0 -3px 0 var(--lime);
 }
 
 .classification-1 {
@@ -1350,6 +1464,18 @@ footer p {
     font-size: 0.95rem;
   }
 
+  .data-freshness {
+    align-items: stretch;
+  }
+
+  .freshness-indicator {
+    flex-basis: 100%;
+  }
+
+  .refresh-data-button {
+    width: 100%;
+  }
+
   .hero-stats {
     grid-template-columns: 1fr;
     min-height: 0;
@@ -1376,6 +1502,10 @@ footer p {
 
   .segmented-control {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .campus-segmented-control {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .quick-filters {

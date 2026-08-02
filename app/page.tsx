@@ -10,6 +10,8 @@ import {
 
 type ClassificationCode = "1" | "2" | "3";
 type ClassificationFilter = "all" | ClassificationCode;
+type CampusCode = "H1" | "H2";
+type CampusFilter = "all" | CampusCode;
 
 type RawMeeting = {
   day: string;
@@ -20,6 +22,10 @@ type RawMeeting = {
 };
 
 type Course = {
+  year: number;
+  semester_code: number;
+  campus_code: CampusCode;
+  campus: string;
   course_code: string;
   course_name_ko: string;
   course_name_en: string;
@@ -61,11 +67,13 @@ type DayCode = "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat";
 type AreaOption = {
   key: string;
   code: string;
+  campusCode: CampusCode;
   classificationCode: ClassificationCode;
   label: string;
 };
 
-const STORAGE_KEY = "hufs-global-2026-2-timetable";
+const STORAGE_KEY = "hufs-all-campuses-2026-2-timetable-v2";
+const LEGACY_STORAGE_KEY = "hufs-global-2026-2-timetable";
 const INITIAL_RESULT_COUNT = 30;
 const RESULT_INCREMENT = 30;
 const PERIODS = Array.from({ length: 12 }, (_, index) => index + 1);
@@ -90,10 +98,10 @@ const CLASSIFICATION_SHORT_LABELS: Record<ClassificationCode, string> = {
   "3": "기초",
 };
 
-const FALLBACK_COUNTS: Record<ClassificationCode, number> = {
-  "1": 1131,
-  "2": 405,
-  "3": 54,
+const CAMPUS_CODES: CampusCode[] = ["H1", "H2"];
+const CAMPUS_LABELS: Record<CampusCode, string> = {
+  H1: "서울",
+  H2: "글로벌",
 };
 
 function normalizeSearch(value: string) {
@@ -108,8 +116,31 @@ function getProfessorName(course: Course) {
   return course.professor_ko || course.professor_en || "담당교수 미정";
 }
 
+function getCampusLabel(course: Course) {
+  return CAMPUS_LABELS[course.campus_code] || course.campus;
+}
+
+function getCourseId(course: Course) {
+  return `${course.year}:${course.semester_code}:${course.campus_code}:${course.course_code}`;
+}
+
+function getLegacyCourseId(courseCode: string) {
+  return `2026:3:H2:${courseCode}`;
+}
+
+function parseStoredCourseIds(serialized: string | null) {
+  if (serialized === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(serialized);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter((item): item is string => typeof item === "string");
+  } catch {
+    return null;
+  }
+}
+
 function getAreaKey(course: Course) {
-  return `${course.classification_code}:${course.area_code}`;
+  return `${course.campus_code}:${course.classification_code}:${course.area_code}`;
 }
 
 function parseMeetings(scheduleEn: string): Meeting[] {
@@ -186,19 +217,53 @@ function findConflict(candidate: Course, selectedCourses: Course[]) {
 }
 
 function formatCollectedAt(value?: string) {
-  if (!value) return "2026. 07. 28.";
+  if (!value) return "확인 중";
+
+  const collectedAt = new Date(value);
+  if (Number.isNaN(collectedAt.getTime())) return "확인 불가";
 
   return new Intl.DateTimeFormat("ko-KR", {
     timeZone: "Asia/Seoul",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(new Date(value));
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).format(collectedAt);
+}
+
+async function fetchCourseData(signal?: AbortSignal) {
+  const cacheKey = Date.now();
+  const [coursesResponse, summaryResponse] = await Promise.all([
+    fetch(`./data/courses.json?v=${cacheKey}`, {
+      signal,
+      cache: "no-store",
+    }),
+    fetch(`./data/summary.json?v=${cacheKey}`, {
+      signal,
+      cache: "no-store",
+    }),
+  ]);
+
+  if (!coursesResponse.ok || !summaryResponse.ok) {
+    throw new Error("강좌 데이터를 불러오지 못했습니다.");
+  }
+
+  const [courseData, summaryData] = await Promise.all([
+    coursesResponse.json() as Promise<Course[]>,
+    summaryResponse.json() as Promise<Summary>,
+  ]);
+
+  return { courseData, summaryData };
 }
 
 function CourseFlags({ course }: { course: Course }) {
   return (
-    <div className="course-flags" aria-label="강좌 특성">
+    <div className="course-flags" aria-label="캠퍼스와 강좌 특성">
+      <span className={`campus-badge campus-${course.campus_code.toLowerCase()}`}>
+        {getCampusLabel(course)}
+      </span>
       <span
         className={`classification-badge classification-${course.classification_code}`}
       >
@@ -217,9 +282,15 @@ export default function Home() {
   const [courses, setCourses] = useState<Course[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [refreshStatus, setRefreshStatus] = useState<{
+    tone: "success" | "warning";
+    text: string;
+  } | null>(null);
 
   const [query, setQuery] = useState("");
+  const [campus, setCampus] = useState<CampusFilter>("all");
   const [classification, setClassification] =
     useState<ClassificationFilter>("all");
   const [areaKey, setAreaKey] = useState("all");
@@ -240,26 +311,21 @@ export default function Home() {
   useEffect(() => {
     const controller = new AbortController();
 
-    async function loadData() {
+    async function loadInitialData() {
       try {
-        const [coursesResponse, summaryResponse] = await Promise.all([
-          fetch("./data/courses.json", { signal: controller.signal }),
-          fetch("./data/summary.json", { signal: controller.signal }),
-        ]);
-
-        if (!coursesResponse.ok || !summaryResponse.ok) {
-          throw new Error("강좌 데이터를 불러오지 못했습니다.");
-        }
-
-        const [courseData, summaryData] = await Promise.all([
-          coursesResponse.json() as Promise<Course[]>,
-          summaryResponse.json() as Promise<Summary>,
-        ]);
-
+        const { courseData, summaryData } = await fetchCourseData(
+          controller.signal,
+        );
         setCourses(courseData);
         setSummary(summaryData);
+        setLoadError("");
       } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (
+          controller.signal.aborted ||
+          (error instanceof DOMException && error.name === "AbortError")
+        ) {
+          return;
+        }
         setLoadError(
           error instanceof Error
             ? error.message
@@ -270,21 +336,53 @@ export default function Home() {
       }
     }
 
-    loadData();
+    void loadInitialData();
     return () => controller.abort();
+  }, []);
+
+  const refreshData = useCallback(async () => {
+    setIsRefreshing(true);
+    setRefreshStatus(null);
+
+    try {
+      const { courseData, summaryData } = await fetchCourseData();
+      setCourses(courseData);
+      setSummary(summaryData);
+      setLoadError("");
+      setRefreshStatus({
+        tone: "success",
+        text: "현재 배포된 최신 데이터를 다시 확인했습니다.",
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "강좌 데이터를 불러오지 못했습니다.";
+      setRefreshStatus({
+        tone: "warning",
+        text: `${message} 기존 데이터를 그대로 유지합니다.`,
+      });
+    } finally {
+      setIsRefreshing(false);
+    }
   }, []);
 
   useEffect(() => {
     const hydrationTask = window.setTimeout(() => {
       try {
         const saved = window.localStorage.getItem(STORAGE_KEY);
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (Array.isArray(parsed)) {
-            setSelectedIds(
-              parsed.filter((item): item is string => typeof item === "string"),
-            );
-          }
+        const savedIds = parseStoredCourseIds(saved);
+
+        if (savedIds !== null) {
+          setSelectedIds([...new Set(savedIds)]);
+        } else {
+          if (saved !== null) window.localStorage.removeItem(STORAGE_KEY);
+          const legacyIds = parseStoredCourseIds(
+            window.localStorage.getItem(LEGACY_STORAGE_KEY),
+          );
+          setSelectedIds([
+            ...new Set((legacyIds ?? []).map(getLegacyCourseId)),
+          ]);
         }
       } catch {
         window.localStorage.removeItem(STORAGE_KEY);
@@ -302,21 +400,19 @@ export default function Home() {
   }, [hasHydratedSelection, selectedIds]);
 
   const courseById = useMemo(
-    () => new Map(courses.map((course) => [course.course_code, course])),
+    () => new Map(courses.map((course) => [getCourseId(course), course])),
     [courses],
   );
 
   const selectedCourses = useMemo(
     () =>
       selectedIds
-        .map((courseCode) => courseById.get(courseCode))
+        .map((courseId) => courseById.get(courseId))
         .filter((course): course is Course => Boolean(course)),
     [courseById, selectedIds],
   );
 
   const classificationCounts = useMemo(() => {
-    if (courses.length === 0) return FALLBACK_COUNTS;
-
     return courses.reduce<Record<ClassificationCode, number>>(
       (counts, course) => {
         counts[course.classification_code] += 1;
@@ -326,15 +422,36 @@ export default function Home() {
     );
   }, [courses]);
 
+  const campusCounts = useMemo(
+    () =>
+      courses.reduce<Record<CampusCode, number>>(
+        (counts, course) => {
+          counts[course.campus_code] += 1;
+          return counts;
+        },
+        { H1: 0, H2: 0 },
+      ),
+    [courses],
+  );
+
+  const campusCourses = useMemo(
+    () =>
+      campus === "all"
+        ? courses
+        : courses.filter((course) => course.campus_code === campus),
+    [campus, courses],
+  );
+
   const areaOptions = useMemo(() => {
     const unique = new Map<string, AreaOption>();
 
-    courses.forEach((course) => {
+    campusCourses.forEach((course) => {
       const key = getAreaKey(course);
       if (!unique.has(key)) {
         unique.set(key, {
           key,
           code: course.area_code,
+          campusCode: course.campus_code,
           classificationCode: course.classification_code,
           label: course.area || course.area_en || course.area_code,
         });
@@ -342,14 +459,17 @@ export default function Home() {
     });
 
     return [...unique.values()].sort((a, b) => {
+      const campusOrder =
+        CAMPUS_CODES.indexOf(a.campusCode) - CAMPUS_CODES.indexOf(b.campusCode);
       const classificationOrder =
         Number(a.classificationCode) - Number(b.classificationCode);
       return (
+        campusOrder ||
         classificationOrder ||
         a.label.localeCompare(b.label, "ko-KR", { numeric: true })
       );
     });
-  }, [courses]);
+  }, [campusCourses]);
 
   const availableAreaOptions = useMemo(
     () =>
@@ -361,20 +481,29 @@ export default function Home() {
     [areaOptions, classification],
   );
 
-  const filteredCourses = useMemo(() => {
+  const effectiveAreaKey =
+    areaKey === "all" ||
+    availableAreaOptions.some((option) => option.key === areaKey)
+      ? areaKey
+      : "all";
+
+  const contextualCourses = useMemo(() => {
     const normalizedQuery = normalizeSearch(query);
 
     return courses.filter((course) => {
+      if (campus !== "all" && course.campus_code !== campus) return false;
       if (
         classification !== "all" &&
         course.classification_code !== classification
       ) {
         return false;
       }
-      if (areaKey !== "all" && getAreaKey(course) !== areaKey) return false;
-      if (onlineOnly && !course.online) return false;
-      if (passFailOnly && !course.pass_fail) return false;
-      if (syllabusOnly && !course.syllabus_available) return false;
+      if (
+        effectiveAreaKey !== "all" &&
+        getAreaKey(course) !== effectiveAreaKey
+      ) {
+        return false;
+      }
 
       if (normalizedQuery) {
         const haystack = normalizeSearch(
@@ -386,6 +515,7 @@ export default function Home() {
             course.course_code,
             course.area,
             course.area_en,
+            getCampusLabel(course),
           ].join(" "),
         );
         if (!haystack.includes(normalizedQuery)) return false;
@@ -394,14 +524,33 @@ export default function Home() {
       return true;
     });
   }, [
-    areaKey,
+    campus,
     classification,
     courses,
-    onlineOnly,
-    passFailOnly,
+    effectiveAreaKey,
     query,
-    syllabusOnly,
   ]);
+
+  const featureCounts = useMemo(
+    () => ({
+      online: contextualCourses.filter((course) => course.online).length,
+      passFail: contextualCourses.filter((course) => course.pass_fail).length,
+      syllabus: contextualCourses.filter((course) => course.syllabus_available)
+        .length,
+    }),
+    [contextualCourses],
+  );
+
+  const filteredCourses = useMemo(
+    () =>
+      contextualCourses.filter((course) => {
+        if (onlineOnly && !course.online) return false;
+        if (passFailOnly && !course.pass_fail) return false;
+        if (syllabusOnly && !course.syllabus_available) return false;
+        return true;
+      }),
+    [contextualCourses, onlineOnly, passFailOnly, syllabusOnly],
+  );
 
   const visibleCourses = filteredCourses.slice(0, visibleCount);
 
@@ -425,52 +574,63 @@ export default function Home() {
     (course) => parseMeetings(course.schedule_en).length === 0,
   );
 
+  const handleCampusChange = useCallback((nextCampus: CampusFilter) => {
+    setCampus(nextCampus);
+    setAreaKey("all");
+    setVisibleCount(INITIAL_RESULT_COUNT);
+  }, []);
+
   const handleClassificationChange = useCallback(
     (nextClassification: ClassificationFilter) => {
       setClassification(nextClassification);
       setVisibleCount(INITIAL_RESULT_COUNT);
+      const selectedArea = areaOptions.find((option) => option.key === areaKey);
       if (
         areaKey !== "all" &&
-        nextClassification !== "all" &&
-        !areaKey.startsWith(`${nextClassification}:`)
+        (!selectedArea ||
+          (nextClassification !== "all" &&
+            selectedArea.classificationCode !== nextClassification))
       ) {
         setAreaKey("all");
       }
     },
-    [areaKey],
+    [areaKey, areaOptions],
   );
 
   function addCourse(course: Course) {
-    if (selectedIds.includes(course.course_code)) return;
+    const courseId = getCourseId(course);
+    if (selectedIds.includes(courseId)) return;
 
     const conflict = findConflict(course, selectedCourses);
     if (conflict) {
       setNotice({
         tone: "warning",
-        text: `${getCourseName(course)}은(는) ${getCourseName(conflict)}과 시간이 겹쳐 추가하지 않았어요.`,
+        text: `${getCampusLabel(course)} ${getCourseName(course)}은(는) ${getCampusLabel(conflict)} ${getCourseName(conflict)}과 시간이 겹쳐 추가하지 않았어요.`,
       });
       return;
     }
 
-    setSelectedIds((current) => [...current, course.course_code]);
+    setSelectedIds((current) => [...current, courseId]);
     setNotice({
       tone: "success",
-      text: `${getCourseName(course)}을(를) 시간표에 추가했어요.`,
+      text: `${getCampusLabel(course)} ${getCourseName(course)}을(를) 시간표에 추가했어요.`,
     });
   }
 
   function removeCourse(course: Course) {
+    const courseId = getCourseId(course);
     setSelectedIds((current) =>
-      current.filter((courseCode) => courseCode !== course.course_code),
+      current.filter((selectedId) => selectedId !== courseId),
     );
     setNotice({
       tone: "neutral",
-      text: `${getCourseName(course)}을(를) 시간표에서 뺐어요.`,
+      text: `${getCampusLabel(course)} ${getCourseName(course)}을(를) 시간표에서 뺐어요.`,
     });
   }
 
   function clearFilters() {
     setQuery("");
+    setCampus("all");
     setClassification("all");
     setAreaKey("all");
     setOnlineOnly(false);
@@ -499,11 +659,11 @@ export default function Home() {
           </span>
           <span>
             <strong>HUFS GRID</strong>
-            <small>GLOBAL · 2026 FALL</small>
+            <small>SEOUL · GLOBAL · 2026 FALL</small>
           </span>
         </a>
         <div className="header-meta" aria-label="데이터 범위">
-          <span>글로벌캠퍼스</span>
+          <span>서울 · 글로벌캠퍼스</span>
           <span className="meta-divider" aria-hidden="true" />
           <span>전체 강좌</span>
         </div>
@@ -518,16 +678,47 @@ export default function Home() {
             <span>빈칸부터 완성까지.</span>
           </h1>
           <p className="hero-description">
-            전공부터 교양, 기초까지 글로벌캠퍼스의 모든 강좌를 한곳에서
+            전공부터 교양, 기초까지 서울·글로벌캠퍼스의 모든 강좌를 한곳에서
             검색하고 겹침 없이 조합해 보세요.
           </p>
+          <div className="data-freshness">
+            <div className="freshness-indicator" role="status" aria-live="polite">
+              <span className="freshness-dot" aria-hidden="true" />
+              <span>
+                <strong>
+                  {summary
+                    ? `마지막 수집 ${formatCollectedAt(summary.collected_at)} KST`
+                    : "데이터 확인 중"}
+                </strong>
+                <small>약 30분마다 자동 확인</small>
+              </span>
+            </div>
+            <button
+              className="refresh-data-button"
+              type="button"
+              onClick={() => void refreshData()}
+              disabled={isLoading || isRefreshing}
+            >
+              {isRefreshing ? "확인 중…" : "최신 데이터 확인"}
+            </button>
+            {refreshStatus && (
+              <p
+                className={`refresh-status refresh-status-${refreshStatus.tone}`}
+                role={refreshStatus.tone === "warning" ? "alert" : "status"}
+              >
+                {refreshStatus.text}
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="hero-stats" aria-label="수록 데이터 요약">
           <div className="hero-total">
             <span>전체</span>
             <strong>
-              {(summary?.unique_course_count ?? 1590).toLocaleString("ko-KR")}
+              {summary
+                ? summary.unique_course_count.toLocaleString("ko-KR")
+                : "—"}
             </strong>
             <small>COURSES</small>
           </div>
@@ -593,6 +784,30 @@ export default function Home() {
             </div>
           </div>
 
+          <fieldset className="campus-filter">
+            <legend>캠퍼스</legend>
+            <div className="segmented-control campus-segmented-control">
+              {(
+                [
+                  ["all", "전체", courses.length],
+                  ["H1", "서울", campusCounts.H1],
+                  ["H2", "글로벌", campusCounts.H2],
+                ] as Array<[CampusFilter, string, number]>
+              ).map(([value, label, count]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={campus === value ? "is-active" : ""}
+                  aria-pressed={campus === value}
+                  onClick={() => handleCampusChange(value)}
+                >
+                  <span>{label}</span>
+                  <small>{count.toLocaleString("ko-KR")}</small>
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
           <fieldset className="classification-filter">
             <legend>이수 구분</legend>
             <div className="segmented-control">
@@ -621,28 +836,36 @@ export default function Home() {
             <label htmlFor="area-filter">학과 · 영역</label>
             <select
               id="area-filter"
-              value={areaKey}
+              value={effectiveAreaKey}
               onChange={(event) => {
                 setAreaKey(event.target.value);
                 setVisibleCount(INITIAL_RESULT_COUNT);
               }}
             >
               <option value="all">모든 학과 · 영역</option>
-              {(["1", "2", "3"] as ClassificationCode[]).map((code) => {
-                const options = availableAreaOptions.filter(
-                  (option) => option.classificationCode === code,
-                );
-                if (options.length === 0) return null;
-                return (
-                  <optgroup key={code} label={CLASSIFICATION_LABELS[code]}>
-                    {options.map((option) => (
-                      <option value={option.key} key={option.key}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </optgroup>
-                );
-              })}
+              {(campus === "all" ? CAMPUS_CODES : [campus]).flatMap(
+                (campusCode) =>
+                  (["1", "2", "3"] as ClassificationCode[]).map((code) => {
+                    const options = availableAreaOptions.filter(
+                      (option) =>
+                        option.campusCode === campusCode &&
+                        option.classificationCode === code,
+                    );
+                    if (options.length === 0) return null;
+                    return (
+                      <optgroup
+                        key={`${campusCode}:${code}`}
+                        label={`${CAMPUS_LABELS[campusCode]} · ${CLASSIFICATION_LABELS[code]}`}
+                      >
+                        {options.map((option) => (
+                          <option value={option.key} key={option.key}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </optgroup>
+                    );
+                  }),
+              )}
             </select>
           </div>
 
@@ -658,7 +881,7 @@ export default function Home() {
                 }}
               />
               <span>온라인</span>
-              <small>{summary?.online_count ?? 7}</small>
+              <small>{featureCounts.online.toLocaleString("ko-KR")}</small>
             </label>
             <label>
               <input
@@ -670,7 +893,7 @@ export default function Home() {
                 }}
               />
               <span>P/F</span>
-              <small>{summary?.pass_fail_count ?? 108}</small>
+              <small>{featureCounts.passFail.toLocaleString("ko-KR")}</small>
             </label>
             <label>
               <input
@@ -682,7 +905,7 @@ export default function Home() {
                 }}
               />
               <span>강의계획서 있음</span>
-              <small>{summary?.syllabus_count ?? 878}</small>
+              <small>{featureCounts.syllabus.toLocaleString("ko-KR")}</small>
             </label>
           </fieldset>
 
@@ -720,7 +943,8 @@ export default function Home() {
             {!isLoading &&
               !loadError &&
               visibleCourses.map((course) => {
-                const isSelected = selectedIds.includes(course.course_code);
+                const courseId = getCourseId(course);
+                const isSelected = selectedIds.includes(courseId);
                 const secondaryName =
                   course.course_name_en &&
                   course.course_name_en !== course.course_name_ko
@@ -728,7 +952,7 @@ export default function Home() {
                     : "";
 
                 return (
-                  <article className="course-card" key={course.course_code}>
+                  <article className="course-card" key={courseId}>
                     <CourseFlags course={course} />
                     <div className="course-title-row">
                       <div>
@@ -740,8 +964,8 @@ export default function Home() {
                         type="button"
                         aria-label={
                           isSelected
-                            ? `${getCourseName(course)} 선택됨`
-                            : `${getCourseName(course)} 시간표에 추가`
+                            ? `${getCampusLabel(course)} ${getCourseName(course)} 선택됨`
+                            : `${getCampusLabel(course)} ${getCourseName(course)} 시간표에 추가`
                         }
                         disabled={isSelected}
                         onClick={() => addCourse(course)}
@@ -913,6 +1137,7 @@ export default function Home() {
                 );
                 const firstPeriod = Math.min(...meeting.periods);
                 const lastPeriod = Math.max(...meeting.periods);
+                const courseId = getCourseId(course);
 
                 return (
                   <article
@@ -921,17 +1146,20 @@ export default function Home() {
                       gridColumn: dayIndex + 2,
                       gridRow: `${firstPeriod + 1} / ${lastPeriod + 2}`,
                     }}
-                    key={`${course.course_code}-${meeting.day}-${meeting.periods.join("-")}`}
-                    aria-label={`${getCourseName(course)}, ${getScheduleLabel(course)}`}
+                    key={`${courseId}:${meeting.day}:${meeting.periods.join("-")}`}
+                    aria-label={`${getCampusLabel(course)} ${getCourseName(course)}, ${getScheduleLabel(course)}`}
                   >
                     <button
                       type="button"
                       onClick={() => removeCourse(course)}
-                      aria-label={`${getCourseName(course)} 시간표에서 삭제`}
+                      aria-label={`${getCampusLabel(course)} ${getCourseName(course)} 시간표에서 삭제`}
                     >
                       ×
                     </button>
-                    <span>{CLASSIFICATION_SHORT_LABELS[course.classification_code]}</span>
+                    <span>
+                      {getCampusLabel(course)} ·{" "}
+                      {CLASSIFICATION_SHORT_LABELS[course.classification_code]}
+                    </span>
                     <strong>{getCourseName(course)}</strong>
                     <small>{course.course_code}</small>
                   </article>
@@ -956,7 +1184,7 @@ export default function Home() {
               </div>
               <ul>
                 {unscheduledCourses.map((course) => (
-                  <li key={course.course_code}>
+                  <li key={getCourseId(course)}>
                     <span
                       className={`classification-dot dot-${course.classification_code}`}
                       aria-hidden="true"
@@ -964,6 +1192,7 @@ export default function Home() {
                     <div>
                       <strong>{getCourseName(course)}</strong>
                       <small>
+                        {getCampusLabel(course)} ·{" "}
                         {course.online ? "온라인" : "시간 미정"} ·{" "}
                         {course.course_code}
                       </small>
@@ -973,7 +1202,7 @@ export default function Home() {
                         href={course.syllabus_url}
                         target="_blank"
                         rel="noreferrer"
-                        aria-label={`${getCourseName(course)} 강의계획서 새 창에서 열기`}
+                        aria-label={`${getCampusLabel(course)} ${getCourseName(course)} 강의계획서 새 창에서 열기`}
                       >
                         계획서 ↗
                       </a>
@@ -981,7 +1210,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => removeCourse(course)}
-                      aria-label={`${getCourseName(course)} 시간표에서 삭제`}
+                      aria-label={`${getCampusLabel(course)} ${getCourseName(course)} 시간표에서 삭제`}
                     >
                       ×
                     </button>
@@ -999,7 +1228,7 @@ export default function Home() {
               </div>
               <ul>
                 {selectedCourses.map((course) => (
-                  <li key={course.course_code}>
+                  <li key={getCourseId(course)}>
                     <span
                       className={`classification-dot dot-${course.classification_code}`}
                       aria-hidden="true"
@@ -1007,8 +1236,8 @@ export default function Home() {
                     <div>
                       <strong>{getCourseName(course)}</strong>
                       <small>
-                        {getProfessorName(course)} · {course.credits}학점 ·{" "}
-                        {getScheduleLabel(course)}
+                        {getCampusLabel(course)} · {getProfessorName(course)} ·{" "}
+                        {course.credits}학점 · {getScheduleLabel(course)}
                       </small>
                     </div>
                     {course.syllabus_available && course.syllabus_url ? (
@@ -1016,7 +1245,7 @@ export default function Home() {
                         href={course.syllabus_url}
                         target="_blank"
                         rel="noreferrer"
-                        aria-label={`${getCourseName(course)} 강의계획서 새 창에서 열기`}
+                        aria-label={`${getCampusLabel(course)} ${getCourseName(course)} 강의계획서 새 창에서 열기`}
                       >
                         계획서 ↗
                       </a>
@@ -1026,7 +1255,7 @@ export default function Home() {
                     <button
                       type="button"
                       onClick={() => removeCourse(course)}
-                      aria-label={`${getCourseName(course)} 시간표에서 삭제`}
+                      aria-label={`${getCampusLabel(course)} ${getCourseName(course)} 시간표에서 삭제`}
                     >
                       삭제
                     </button>
@@ -1047,7 +1276,11 @@ export default function Home() {
           </p>
         </div>
         <div className="footer-meta">
-          <span>데이터 기준 {formatCollectedAt(summary?.collected_at)}</span>
+          <span>
+            {summary
+              ? `마지막 수집 ${formatCollectedAt(summary.collected_at)} KST`
+              : "데이터 확인 중"}
+          </span>
           <a
             href="https://wis.hufs.ac.kr/src08/jsp/lecture/LECTURE2020L.jsp"
             target="_blank"

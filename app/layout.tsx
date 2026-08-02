@@ -2,9 +2,9 @@ import type { Metadata, Viewport } from "next";
 import { headers } from "next/headers";
 import "./globals.css";
 
-const title = "HUFS GRID | 글로벌캠퍼스 2026-2 시간표";
+const title = "HUFS GRID | 서울·글로벌 2026-2 시간표";
 const description =
-  "한국외대 글로벌캠퍼스 2026학년도 2학기 전공·교양·기초 1,590개 강좌를 검색하고 충돌 없이 시간표를 조합해 보세요.";
+  "한국외대 서울·글로벌캠퍼스 2026학년도 2학기 전공·교양·기초 전체 강좌를 검색하고 충돌 없이 시간표를 조합해 보세요.";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
@@ -33,6 +33,7 @@ export async function generateMetadata(): Promise<Metadata> {
     keywords: [
       "한국외대",
       "한국외국어대학교",
+      "서울캠퍼스",
       "글로벌캠퍼스",
       "시간표",
       "수강신청",
@@ -41,7 +42,7 @@ export async function generateMetadata(): Promise<Metadata> {
     openGraph: {
       title: "HUFS GRID | 2026-2 시간표 시뮬레이터",
       description:
-        "글로벌캠퍼스 1,590개 강좌를 검색하고 겹침 없이 조합하세요.",
+        "서울·글로벌캠퍼스 전체 강좌를 검색하고 겹침 없이 조합하세요.",
       type: "website",
       locale: "ko_KR",
       url: origin,
@@ -50,7 +51,7 @@ export async function generateMetadata(): Promise<Metadata> {
           url: socialImage,
           width: 1733,
           height: 907,
-          alt: "HUFS GRID 글로벌캠퍼스 2026-2 시간표 시뮬레이터",
+          alt: "HUFS GRID 서울·글로벌캠퍼스 2026-2 시간표 시뮬레이터",
         },
       ],
     },
@@ -58,7 +59,7 @@ export async function generateMetadata(): Promise<Metadata> {
       card: "summary_large_image",
       title: "HUFS GRID | 2026-2 시간표 시뮬레이터",
       description:
-        "글로벌캠퍼스 1,590개 강좌를 검색하고 겹침 없이 조합하세요.",
+        "서울·글로벌캠퍼스 전체 강좌를 검색하고 겹침 없이 조합하세요.",
       images: [socialImage],
     },
   };
